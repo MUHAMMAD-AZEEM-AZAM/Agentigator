@@ -89,6 +89,7 @@ export default function Assistant() {
   });
   const pendingActionByToolCallIdRef = useRef<Record<string, string>>({});
   const pendingActionTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const pendingToolCallTimeoutsRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // Audio playback queue for streamed response chunks
   const audioQueueRef = useRef<string[]>([]);
@@ -292,7 +293,7 @@ export default function Assistant() {
     // Gemini session is ready
     WebSocketService.on('connection_ready', (message) => {
       setAgentState('idle');
-      setAssistantMessage("Hi! I'm ready to help you. Tap the mic to start talking.");
+      setAssistantMessage('');
       if (preferredLanguage) {
         WebSocketService.sendConfig({ language: preferredLanguage });
       }
@@ -437,6 +438,16 @@ export default function Assistant() {
       if (message.action === 'get_page_text' || message.action === 'wait_for_element') {
         if (toolCallId) {
           pendingToolCallIdsRef.current[message.action]?.push(toolCallId);
+          if (pendingToolCallTimeoutsRef.current[toolCallId]) {
+            clearTimeout(pendingToolCallTimeoutsRef.current[toolCallId]);
+          }
+          pendingToolCallTimeoutsRef.current[toolCallId] = setTimeout(() => {
+            WebSocketService.sendToolResult(message.action, toolCallId, {
+              status: 'error',
+              message: 'Timed out waiting for WebView response',
+            });
+            delete pendingToolCallTimeoutsRef.current[toolCallId];
+          }, 5000);
         }
         return; // Don't send result yet, waiting for onMessage
       }
@@ -787,9 +798,17 @@ export default function Assistant() {
                   console.log("WebView Message:", msgData.type);
                   if (msgData.type === 'page_text_result') {
                      const toolCallId = msgData.tool_call_id || pendingToolCallIdsRef.current.get_page_text?.shift() || '';
+                     if (toolCallId && pendingToolCallTimeoutsRef.current[toolCallId]) {
+                       clearTimeout(pendingToolCallTimeoutsRef.current[toolCallId]);
+                       delete pendingToolCallTimeoutsRef.current[toolCallId];
+                     }
                      WebSocketService.sendToolResult('get_page_text', toolCallId, msgData.data);
                   } else if (msgData.type === 'wait_element_result') {
                      const toolCallId = msgData.tool_call_id || pendingToolCallIdsRef.current.wait_for_element?.shift() || '';
+                     if (toolCallId && pendingToolCallTimeoutsRef.current[toolCallId]) {
+                       clearTimeout(pendingToolCallTimeoutsRef.current[toolCallId]);
+                       delete pendingToolCallTimeoutsRef.current[toolCallId];
+                     }
                      WebSocketService.sendToolResult('wait_for_element', toolCallId, msgData.data);
                   } else if (msgData.type === 'action_result') {
                      const toolCallId = msgData.tool_call_id || '';

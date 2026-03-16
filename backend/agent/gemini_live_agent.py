@@ -55,6 +55,9 @@ class GeminiLiveAgent:
             pass
         self._audio_disabled_until = 0.0
         self._suppress_audio_until = 0.0
+        self._recent_tool_calls: Dict[str, float] = {}
+        self._last_search_at: float = 0.0
+        self._last_search_query: str = ""
         
         # Audio debugging setup
         os.makedirs("debug_audio", exist_ok=True)
@@ -89,10 +92,10 @@ class GeminiLiveAgent:
 PREFERRED_LANGUAGE:
 - {self._preferred_language}
 
-GREETING:
-- ALWAYS begin the conversation with a warm greeting in the appropriate language.
-- If the user's language is unclear, greet in English first.
-- Example: "Hi there! I'm your assistant. How can I help you today?"
+START OF CONVERSATION:
+- Do not announce the language you will use.
+- Do not greet until the user speaks first.
+- When the user speaks, respond with a brief, natural acknowledgment and continue the task.
 
 CORE BEHAVIOR:
 - Have natural conversations. Be warm, concise, and helpful.
@@ -106,8 +109,11 @@ CORE BEHAVIOR:
 - If a tool fails because the browser is not ready, ask for a moment and try the browser tool again.
 - Keep the conversation flowing — don't go silent.
 - Work independently: do not ask the user for confirmations about clicks or form submission.
-- Only ask the user when you need information that is required to proceed and not visible on the screen.
+- Ask concise, relevant follow-up questions whenever critical details are missing or the request is ambiguous.
+- Only ask for information that is required to proceed and not visible on the screen.
+- Do not ask the same question twice if the user already answered it.
 - If an action fails, take a screenshot, read the page text, try a different selector, and retry without asking the user.
+- If you retry a tool, change your approach (different selector or additional page text) instead of repeating the same call.
 
 LANGUAGE:
 - Preferred language may be provided by the app. Respect it unless the user explicitly asks to switch.
@@ -120,6 +126,7 @@ WEB SEARCH:
 - If you need to search for something, use the `search_web` tool.
 - This will open google.com and search for the query automatically.
 - Once the page loads, use `get_page_text` to read the results or click links.
+- Do not run multiple searches in a row for the same request. After one search, read the results and proceed.
 
 FORM FILLING WORKFLOW:
 - When the user asks to fill a form, first load the URL.
@@ -154,6 +161,10 @@ IMPORTANT:
 - When asked to fill a form and the website is unknown, search for it and navigate yourself.
 - Once you open the website, find the form and start filling it by asking only for missing personal info.
 - Retry actions 2-3 times with different selectors and page reads before asking the user about a blocker.
+- if user asked for a query related to government works or form filling like creating of new passport or license, degree attestation etc. go to official website and try to find the most suitable form to fill to apply.
+- For government tasks, prioritize official government domains (e.g., .gov, .gov.*, ministry or department sites).
+- If you land on a non-official or third-party site, back out and search for the official site instead.
+- Verify the page text to confirm you are on the correct official page before starting to fill any form.
 """
 
     def _get_function_declarations(self) -> list:
@@ -627,6 +638,35 @@ IMPORTANT:
         """Handle tool calls from Gemini — send to mobile app for execution."""
         for fc in tool_call.function_calls:
             logger.info(f"Tool call: {fc.name}({fc.args})")
+            tool_args_key = json.dumps(fc.args or {}, sort_keys=True)
+            tool_key = f"{fc.name}:{tool_args_key}"
+            now = time.time()
+            last_time = self._recent_tool_calls.get(tool_key)
+            if last_time and (now - last_time) < 8.0:
+                logger.warning(f"Duplicate tool call ignored: {tool_key}")
+                await self._send_tool_response_to_gemini(
+                    fc.name, fc.id, {"status": "error", "message": "Duplicate tool call ignored"}
+                )
+                continue
+            self._recent_tool_calls[tool_key] = now
+
+            if fc.name == "search_web":
+                query = (fc.args or {}).get("query", "")
+                normalized = " ".join(query.lower().split())
+                if normalized == self._last_search_query and (now - self._last_search_at) < 12.0:
+                    logger.warning(f"Repeated search ignored: {normalized}")
+                    await self._send_tool_response_to_gemini(
+                        fc.name, fc.id, {"status": "error", "message": "Repeated search ignored. Read the results and continue."}
+                    )
+                    continue
+                if (now - self._last_search_at) < 6.0:
+                    logger.warning("Search throttled: another search is already in progress")
+                    await self._send_tool_response_to_gemini(
+                        fc.name, fc.id, {"status": "error", "message": "Search already in progress. Use get_page_text and proceed."}
+                    )
+                    continue
+                self._last_search_at = now
+                self._last_search_query = normalized
 
             # Special case: close_browser is handled locally
             if fc.name == "close_browser":
@@ -705,13 +745,10 @@ IMPORTANT:
                 pass
             if self.session:
                 try:
-                    language_names = {"en": "English", "ur": "Urdu", "hi": "Hindi"}
-                    language_label = language_names.get(language, language)
-                    await self.session.send_realtime_input(
-                        text=f"Preferred language is {language_label}. Follow the language rules."
-                    )
+                    # Do not announce language changes to the user.
+                    pass
                 except Exception as e:
-                    logger.error(f"Error sending language hint: {e}")
+                    logger.error(f"Error updating language: {e}")
         logger.info(f"Config update: {config}")
 
     async def resume_after_user_action(self):

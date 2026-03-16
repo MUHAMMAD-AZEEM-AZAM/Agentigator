@@ -1,0 +1,11 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+venv/
+storage/
+debug_*.py
+test_*.py
+debug_audio/
+test_audio.raw
+*.log
